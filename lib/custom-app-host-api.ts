@@ -64,6 +64,8 @@ import {
 import type { ApiConfig, VoiceApiConfig, WorldBookConfig, WorldBookEntry } from "./settings-types";
 import { createSTTSession } from "./stt-service";
 import { generateImageFromConfiguredApi } from "./image-generation-service";
+import { loadMediaBlob } from "./media-cache-storage";
+import { validateOwnedAppImageReference } from "./image-generation-reference-policy";
 import { getThemeAssetDataUrl, saveThemeAssetFromBlob } from "./theme-storage";
 import type { ThemeAssetType } from "./theme-types";
 import { synthesizeSpeech } from "./tts-service";
@@ -89,6 +91,10 @@ const CUSTOM_APP_BADGES_KEY = "ai_phone_custom_app_badges_v1";
 const CUSTOM_APP_TASKS_KEY = "ai_phone_custom_app_tasks_v1";
 const CUSTOM_APP_WORLD_ACTIVATIONS_KEY = "ai_phone_custom_app_world_activations_v1";
 const CUSTOM_APP_SUGGESTIONS_KEY = "ai_phone_custom_app_suggestions_v1";
+// APP 自己 media.put 存入的媒体引用登记表（与 custom-app-runner 保持一致）
+const CUSTOM_APP_MEDIA_REFS_COLLECTION = "__media_refs";
+// 用户参考图体积上限：与 media.put 的 25MB 上限对齐
+const CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES = 25 * 1024 * 1024;
 
 export const CUSTOM_APP_HOST_STATE_UPDATED_EVENT = "ai-phone-custom-app-host-state-updated";
 
@@ -1366,14 +1372,42 @@ export async function runCustomAppAiClassify(app: InstalledCustomApp, record: Re
   return { label, raw };
 }
 
+/**
+ * 解析 APP 传来的用户参考图引用（安全边界）。
+ * 只允许 APP 使用自己 media.put 存入的图片：ref 必须登记在本 APP 的
+ * __media_refs 集合里，且是 image 类别、体积不超过 25MB。
+ * 这样 APP 无法通过猜 ref 读取别的 APP 或宿主的媒体。
+ */
+async function resolveOwnedCustomAppUserReferenceImage(
+  app: InstalledCustomApp,
+  refValue: unknown,
+): Promise<{ dataUrl: string; mimeType: string } | null> {
+  const ref = cleanText(refValue, 240);
+  if (!ref) return null;
+  const ownedRows = readCustomAppCollection(app.id, CUSTOM_APP_MEDIA_REFS_COLLECTION);
+  const media = ref.startsWith("media-store://") ? await loadMediaBlob(ref) : null;
+  validateOwnedAppImageReference({
+    ref,
+    ownedRows,
+    media: media
+      ? { category: media.category, mimeType: media.mimeType || media.blob.type || "", bytes: media.blob.size }
+      : null,
+    maxBytes: CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES,
+  });
+  if (!media) throw new Error("App 用户参考图已被删除或不可用。");
+  const mimeType = media.mimeType || media.blob.type || "image/png";
+  return { dataUrl: await blobToDataUrl(media.blob), mimeType };
+}
+
 export async function generateCustomAppImage(app: InstalledCustomApp, record: Record<string, unknown>): Promise<Record<string, unknown>> {
   const description = cleanText(record.prompt ?? record.description, 4000);
   if (!description) throw new Error("ai.generateImage 需要 prompt。");
   const characterId = cleanText(record.characterId, 160) || undefined;
   const useReferenceImage = record.useReferenceImage === true;
+  const appUserReferenceImage = await resolveOwnedCustomAppUserReferenceImage(app, record.userReferenceImageRef) ?? undefined;
   const timeoutMs = optionalCustomAppTimeoutMs(record.timeoutMs);
   const result = await withOptionalCustomAppTimeout(timeoutMs, "ai.generateImage", signal => (
-    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, signal })
+    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, appUserReferenceImage, signal })
   ));
   if (!result) throw new Error("生图功能未配置或未启用，请先在小手机设置里配置生图 API。");
   return {
@@ -1383,6 +1417,11 @@ export async function generateCustomAppImage(app: InstalledCustomApp, record: Re
     prompt: result.prompt,
     revisedPrompt: result.revisedPrompt,
     usedReferenceImage: result.usedReferenceImage,
+    usedCharacterReferenceImage: result.usedCharacterReferenceImage,
+    usedUserReferenceImage: result.usedUserReferenceImage,
+    userReferenceImageRequested: result.userReferenceImageRequested,
+    userReferenceImageStatus: result.userReferenceImageStatus,
+    userReferenceImageMessage: result.userReferenceImageMessage,
   };
 }
 
