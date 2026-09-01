@@ -5,6 +5,11 @@ import { getChatImageFromIndexedDB } from "./chat-asset-storage";
 import { storeMediaBlob } from "./media-cache-storage";
 import { throwIfAborted } from "./abort-utils";
 import {
+  getUserReferenceImagePolicy,
+  isReferenceInputUnsupportedError,
+  redactImageGenerationError,
+} from "./image-generation-reference-policy";
+import {
   NOVELAI_COMMON_MODELS,
   getNovelAiResolution,
   normalizeNovelAiModel,
@@ -14,6 +19,12 @@ import {
   normalizeNovelAiSteps,
 } from "./novelai-image-config";
 
+/** 用户参考图（App 上传图）的处置结果：没请求 / 真的用上了 / 降级成纯提示词 */
+export type UserReferenceImageStatus = "not_requested" | "used" | "fallback_prompt";
+
+/** 由 APP 侧提供的用户参考图（已归一为 dataUrl） */
+export type AppUserReferenceImage = { dataUrl: string; mimeType: string };
+
 export type ImageGenerationResult = {
   mediaRef: string;
   dataUrl: string;
@@ -21,6 +32,11 @@ export type ImageGenerationResult = {
   mimeType: string;
   prompt: string;
   usedReferenceImage: boolean;
+  usedCharacterReferenceImage: boolean;
+  usedUserReferenceImage: boolean;
+  userReferenceImageRequested: boolean;
+  userReferenceImageStatus: UserReferenceImageStatus;
+  userReferenceImageMessage?: string;
   revisedPrompt?: string;
 };
 
@@ -241,7 +257,7 @@ async function parseImageGenerationResponse(res: Response, signal?: AbortSignal)
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`生图 API 错误 ${res.status}: ${text.slice(0, 600)}`);
+    throw new Error(`生图 API 错误 ${res.status}: ${redactImageGenerationError(text)}`);
   }
 
   if (contentType.startsWith("image/")) {
@@ -269,6 +285,15 @@ async function parseImageGenerationResponse(res: Response, signal?: AbortSignal)
     mimeType: extracted.mimeType || "image/png",
     revisedPrompt: extracted.revisedPrompt,
   };
+}
+
+// 服务端返回的错误统一脱敏，并保留 HTTP 状态码——参考图降级判定要靠状态码识别
+// 「edits/multipart 不被兼容站接受」这一类错误。
+function formatServerImageError(error: unknown, httpStatus: number): string {
+  const detail = redactImageGenerationError(error);
+  return detail
+    ? `生图 API 错误 ${httpStatus}: ${detail}`
+    : `生图请求失败 ${httpStatus}`;
 }
 
 export function filterLikelyImageModels(models: string[]): string[] {
@@ -323,28 +348,32 @@ export const IMAGE_GEN_PROXY_URL = (process.env.NEXT_PUBLIC_IMAGE_GEN_PROXY_URL 
 async function generateImageDirect(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
   /** 走通用代理:请求发往代理地址,真实上游放进 x-upstream-base-url 头 */
   proxyBaseUrl?: string;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal, proxyBaseUrl } = params;
+  const { settings, prompt, referenceImageDataUrls, signal, proxyBaseUrl } = params;
   throwIfAborted(signal);
-  const hasReference = Boolean(referenceImageDataUrl);
+  const hasReference = referenceImageDataUrls.length > 0;
   const url = buildImageUrl(proxyBaseUrl || settings.baseUrl, hasReference ? "edits" : "generations");
   const headers: Record<string, string> = { Authorization: `Bearer ${settings.apiKey}` };
   if (proxyBaseUrl) headers["x-upstream-base-url"] = normalizeBaseUrl(settings.baseUrl);
   let body: BodyInit;
 
   if (hasReference) {
-    const converted = dataUrlToBlob(referenceImageDataUrl || "");
-    if (!converted) throw new Error("参考图格式无效");
+    const converted = referenceImageDataUrls.map(dataUrlToBlob);
+    if (converted.some(item => !item)) throw new Error("参考图格式无效");
     const form = new FormData();
     form.set("model", settings.model);
     form.set("prompt", prompt);
     if (settings.size && settings.size !== "auto") form.set("size", settings.size);
     if (settings.quality && settings.quality !== "auto") form.set("quality", settings.quality);
-    form.append("image", converted.blob, `reference.${imageExtension(converted.mimeType)}`);
+    // 多张参考图 = 同一个 image 字段 append 多次（OpenAI Images edits 的数组写法）
+    converted.forEach((item, index) => {
+      const entry = item as { blob: Blob; mimeType: string };
+      form.append("image", entry.blob, `reference-${index + 1}.${imageExtension(entry.mimeType)}`);
+    });
     body = form;
   } else {
     headers["Content-Type"] = "application/json";
@@ -391,7 +420,7 @@ const directCorsFailedBaseUrls = new Set<string>();
 async function generateImageViaServerOrProxy(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
   if (IMAGE_GEN_PROXY_URL) {
@@ -424,10 +453,10 @@ async function generateImageViaServerOrProxy(params: {
 async function generateImageViaServer(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal } = params;
+  const { settings, prompt, referenceImageDataUrls, signal } = params;
   throwIfAborted(signal);
   // 防"无限卡住":函数被平台中途击杀时流可能既不关闭也不报错。
   // 总超时 180s + 断流检测(心跳每 3s 一个字节,超过 25s 没有任何字节视为断流)。
@@ -449,7 +478,9 @@ async function generateImageViaServer(params: {
         prompt,
         size: settings.size,
         quality: settings.quality,
-        referenceImageDataUrl: referenceImageDataUrl || undefined,
+        // 单张字段保持对旧服务端兼容；多张时额外带数组（新服务端优先读数组）
+        referenceImageDataUrl: referenceImageDataUrls[0] || undefined,
+        ...(referenceImageDataUrls.length > 1 ? { referenceImageDataUrls } : {}),
       }),
     });
     throwIfAborted(signal);
@@ -492,14 +523,14 @@ async function generateImageViaServer(params: {
       }
       throwIfAborted(signal);
       if (data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${data.httpStatus ?? res.status}`);
+        throw new Error(formatServerImageError(data.error, data.httpStatus ?? res.status));
       }
     } else {
       // 非流式回退(旧服务端等)
       data = await res.json().catch(() => ({})) as ServerImagePayload;
       throwIfAborted(signal);
       if (!res.ok || data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${res.status}`);
+        throw new Error(formatServerImageError(data.error, res.status));
       }
     }
     return { b64: data.b64, mimeType: data.mimeType, revisedPrompt: data.revisedPrompt };
@@ -729,6 +760,8 @@ export async function generateImageFromConfiguredApi(params: {
   characterId?: string;
   useReferenceImage?: boolean;
   settings?: ImageGenerationSettings;
+  /** APP 传入的用户参考图（如时光相册的用户自拍），仅 gpt-image-2 会真正带上 */
+  appUserReferenceImage?: AppUserReferenceImage;
   signal?: AbortSignal;
 }): Promise<ImageGenerationResult | null> {
   const settings = params.settings ?? loadImageGenerationSettings();
@@ -769,6 +802,13 @@ export async function generateImageFromConfiguredApi(params: {
       mimeType,
       prompt: fullPrompt,
       usedReferenceImage: false,
+      usedCharacterReferenceImage: false,
+      usedUserReferenceImage: false,
+      userReferenceImageRequested: Boolean(params.appUserReferenceImage?.dataUrl),
+      userReferenceImageStatus: params.appUserReferenceImage?.dataUrl ? "fallback_prompt" : "not_requested",
+      userReferenceImageMessage: params.appUserReferenceImage?.dataUrl
+        ? "NovelAI 生图不支持 App 用户参考图，已使用提示词生成。"
+        : undefined,
       revisedPrompt: data.revisedPrompt,
     };
   }
@@ -781,15 +821,56 @@ export async function generateImageFromConfiguredApi(params: {
     ? await getChatImageFromIndexedDB(reference.assetId)
     : null;
   throwIfAborted(params.signal);
-  const referenceImageDataUrl = rawReferenceImageDataUrl
+  const characterReferenceImageDataUrl = rawReferenceImageDataUrl
     ? await normalizeReferenceImageForEdit(rawReferenceImageDataUrl)
     : null;
   throwIfAborted(params.signal);
+
+  // 用户参考图（App 上传）：只有能归一到 gpt-image-2 的模型才尝试走 images/edits 的
+  // multipart image 字段；其他模型直接降级成纯提示词，避免白扣一次生图费用。
+  const userReferenceRequested = Boolean(params.appUserReferenceImage?.dataUrl);
+  const policy = getUserReferenceImagePolicy(settings.model);
+  const rawUserReferenceImage = params.appUserReferenceImage?.dataUrl ?? "";
+  const userReferenceImageDataUrl = rawUserReferenceImage && policy.canAttemptImageInput
+    ? await normalizeReferenceImageForEdit(rawUserReferenceImage)
+    : null;
+  throwIfAborted(params.signal);
+
   const prompt = mergePrompt(description, settings.extraPrompt);
 
-  const data = settings.requestMode === "direct"
-    ? await generateImageDirect({ settings, prompt, referenceImageDataUrl, signal: params.signal })
-    : await generateImageViaServerOrProxy({ settings, prompt, referenceImageDataUrl, signal: params.signal });
+  const characterOnlyReferences = characterReferenceImageDataUrl ? [characterReferenceImageDataUrl] : [];
+  // 顺序固定：用户图在前、角色图在后
+  const allReferences = [userReferenceImageDataUrl, characterReferenceImageDataUrl].filter(Boolean) as string[];
+
+  const runRequest = (referenceImageDataUrls: string[]) => (
+    settings.requestMode === "direct"
+      ? generateImageDirect({ settings, prompt, referenceImageDataUrls, signal: params.signal })
+      : generateImageViaServerOrProxy({ settings, prompt, referenceImageDataUrls, signal: params.signal })
+  );
+
+  let usedUserReferenceImage = false;
+  let userReferenceImageStatus: UserReferenceImageStatus = "not_requested";
+  let userReferenceImageMessage: string | undefined;
+  let data: ImageGenerationApiResponse;
+
+  if (userReferenceRequested && !policy.canAttemptImageInput) {
+    userReferenceImageStatus = "fallback_prompt";
+    userReferenceImageMessage = "当前模型不支持 App 用户参考图，已使用提示词生成。";
+    data = await runRequest(characterOnlyReferences);
+  } else {
+    try {
+      data = await runRequest(allReferences);
+      usedUserReferenceImage = Boolean(userReferenceImageDataUrl);
+      if (userReferenceRequested) userReferenceImageStatus = "used";
+    } catch (error) {
+      // 只有「服务商不接受图片入参」才降级重试一次；鉴权、限流、超时、5xx 照常抛出。
+      if (!userReferenceRequested || !isReferenceInputUnsupportedError(error)) throw error;
+      throwIfAborted(params.signal);
+      userReferenceImageStatus = "fallback_prompt";
+      userReferenceImageMessage = "当前服务商未接受 App 用户参考图，已使用提示词生成。";
+      data = await runRequest(characterOnlyReferences);
+    }
+  }
 
   throwIfAborted(params.signal);
   const mimeType = data.mimeType || "image/png";
@@ -797,13 +878,19 @@ export async function generateImageFromConfiguredApi(params: {
   throwIfAborted(params.signal);
   const mediaRef = await storeMediaBlob(blob, mimeType, "image");
   throwIfAborted(params.signal);
+  const usedCharacterReferenceImage = Boolean(characterReferenceImageDataUrl);
   return {
     mediaRef,
     dataUrl: `data:${mimeType};base64,${data.b64}`,
     blob,
     mimeType,
     prompt,
-    usedReferenceImage: Boolean(referenceImageDataUrl),
+    usedReferenceImage: usedCharacterReferenceImage || usedUserReferenceImage,
+    usedCharacterReferenceImage,
+    usedUserReferenceImage,
+    userReferenceImageRequested: userReferenceRequested,
+    userReferenceImageStatus,
+    userReferenceImageMessage,
     revisedPrompt: data.revisedPrompt,
   };
 }
