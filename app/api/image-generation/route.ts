@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, type Dispatcher } from "undici";
 import JSZip from "jszip";
+import { redactImageGenerationError } from "@/lib/image-generation-reference-policy";
 import {
   NOVELAI_DEFAULT_MODEL,
   getNovelAiResolution,
@@ -25,6 +26,8 @@ type ImageGenerationRequest = {
   size?: string;
   quality?: string;
   referenceImageDataUrl?: string;
+  /** 多张参考图（用户图在前、角色图在后）；旧客户端只发单张字段 */
+  referenceImageDataUrls?: string[];
   // NovelAI 专属参数
   negativePrompt?: string;
   steps?: number;
@@ -301,7 +304,14 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const baseUrl = input.baseUrl?.trim();
     const model = input.model?.trim();
     const prompt = input.prompt?.trim();
-    const hasReference = Boolean(input.referenceImageDataUrl?.trim());
+    // 参考图：优先读数组（最多两张），没有数组时回退到旧的单张字段
+    const referenceImageDataUrls = (Array.isArray(input.referenceImageDataUrls)
+      ? input.referenceImageDataUrls.filter((item): item is string => typeof item === "string" && item.startsWith("data:image/")).slice(0, 2)
+      : []);
+    if (referenceImageDataUrls.length === 0 && input.referenceImageDataUrl?.trim()) {
+      referenceImageDataUrls.push(input.referenceImageDataUrl.trim());
+    }
+    const hasReference = referenceImageDataUrls.length > 0;
 
     if (!apiKey) return { status: 400, body: { error: "缺少 API Key" } };
     if (!baseUrl) return { status: 400, body: { error: "缺少 Base URL" } };
@@ -313,14 +323,18 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     let body: BodyInit;
 
     if (hasReference) {
-      const converted = dataUrlToBlob(input.referenceImageDataUrl || "");
-      if (!converted) return { status: 400, body: { error: "参考图格式无效" } };
+      const converted = referenceImageDataUrls.map(dataUrlToBlob);
+      if (converted.some(item => !item)) return { status: 400, body: { error: "参考图格式无效" } };
       const form = new FormData();
       form.set("model", model);
       form.set("prompt", prompt);
       if (input.size && input.size !== "auto") form.set("size", input.size);
       if (input.quality && input.quality !== "auto") form.set("quality", input.quality);
-      form.append("image", converted.blob, `reference.${converted.mimeType.split("/")[1] || "png"}`);
+      // 多张参考图 = 同一个 image 字段 append 多次
+      converted.forEach((item, index) => {
+        const entry = item as { blob: Blob; mimeType: string };
+        form.append("image", entry.blob, `reference-${index + 1}.${entry.mimeType.split("/")[1] || "png"}`);
+      });
       body = form;
     } else {
       headers["Content-Type"] = "application/json";
@@ -344,7 +358,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      return { status: 502, body: { error: `生图 API 错误 ${res.status}: ${errText.slice(0, 600)}` } };
+      return { status: 502, body: { error: `生图 API 错误 ${res.status}: ${redactImageGenerationError(errText).slice(0, 600)}` } };
     }
 
     if (contentType.startsWith("image/")) {
@@ -374,7 +388,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const status = message.toLowerCase().includes("abort") ? 504 : 502;
-    return { status, body: { error: message } };
+    return { status, body: { error: redactImageGenerationError(message) } };
   }
 }
 
@@ -406,7 +420,7 @@ export async function POST(req: NextRequest) {
             controller.enqueue(encoder.encode("\n" + IMAGE_STREAM_RESULT_MARKER + JSON.stringify({ httpStatus: status, ...body })));
           })
           .catch((err) => {
-            const message = err instanceof Error ? err.message : String(err);
+            const message = redactImageGenerationError(err);
             try {
               controller.enqueue(encoder.encode("\n" + IMAGE_STREAM_RESULT_MARKER + JSON.stringify({ httpStatus: 502, error: message })));
             } catch { /* 流已关闭 */ }
